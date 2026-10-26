@@ -1,0 +1,669 @@
+<script>
+  // ===== מצב האפליקציה =====
+  const CHAT_KEY = 'recipes.chat';
+  const TASKS_KEY = 'recipes.tasks.';
+
+  const state = {
+    view: 'chat',          // chat | list | recipe | edit
+    chat: loadChat(),
+    busy: false,
+    list: null,            // null = עוד לא נטען
+    query: '',
+    current: null,         // { id, recipe, draft, tab }
+    expandedStep: null,
+  };
+
+  function emptyChat() {
+    // history — ההודעות בפורמט של Claude API (כולל בלוקים פנימיים)
+    // display — הבועות שמוצגות על המסך
+    return { history: [], display: [], recipe: null, problems: [], editingId: null, editingName: '', context: '', dirty: false };
+  }
+
+  function loadChat() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(CHAT_KEY));
+      if (saved && Array.isArray(saved.history)) return Object.assign(emptyChat(), saved);
+    } catch (e) { /* אין גישה לאחסון — מתחילים מחדש */ }
+    return emptyChat();
+  }
+  function saveChat() {
+    try { localStorage.setItem(CHAT_KEY, JSON.stringify(state.chat)); } catch (e) { }
+  }
+
+  // ===== עזרים =====
+  const $ = (id) => document.getElementById(id);
+  const main = $('main');
+
+  function esc(value) {
+    return String(value == null ? '' : value)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function formatMinutes(minutes) {
+    const m = Math.round(Number(minutes) || 0);
+    if (m <= 0) return '';
+    if (m < 60) return m + " דק'";
+    const h = Math.floor(m / 60), rest = m % 60;
+    const hours = h === 1 ? 'שעה' : h === 2 ? 'שעתיים' : h + ' שעות';
+    return rest ? hours + ' ו-' + rest + " דק'" : hours;
+  }
+
+  function recipeMeta(r) {
+    return [r.category, r.servings ? r.servings + ' מנות' : '', formatMinutes(r.totalMinutes)]
+      .filter(Boolean).map(esc).join(' · ');
+  }
+
+  let toastTimer;
+  function toast(message, isError) {
+    const el = $('toast');
+    el.textContent = message;
+    el.className = 'toast' + (isError ? ' error' : '');
+    el.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { el.hidden = true; }, isError ? 6000 : 2500);
+  }
+
+  // קריאה לפונקציה בשרת (Code.gs) שמחזירה Promise
+  function server(fn, ...args) {
+    return new Promise((resolve, reject) => {
+      google.script.run
+        .withSuccessHandler(resolve)
+        .withFailureHandler((err) => reject(new Error(err && err.message ? err.message : String(err))))[fn](...args);
+    });
+  }
+
+  // כפתור שדורש לחיצה שנייה לאישור (במקום חלון "בטוח?")
+  function confirmTap(button, action) {
+    if (button.dataset.armed) {
+      delete button.dataset.armed;
+      action();
+      return;
+    }
+    const original = button.textContent;
+    button.dataset.armed = '1';
+    button.classList.add('confirming');
+    button.textContent = 'לחץ שוב לאישור';
+    setTimeout(() => {
+      delete button.dataset.armed;
+      button.classList.remove('confirming');
+      button.textContent = original;
+    }, 3000);
+  }
+
+  // ===== ניווט =====
+  function go(view) {
+    state.view = view;
+    if (view === 'list') loadList();
+    render();
+  }
+
+  document.querySelectorAll('.tab').forEach((tab) => {
+    tab.addEventListener('click', () => go(tab.dataset.view));
+  });
+  $('backBtn').addEventListener('click', () => {
+    if (state.view === 'edit') { state.view = 'recipe'; render(); return; }
+    go(state.current && state.current.draft ? 'chat' : 'list');
+  });
+  $('newChatBtn').addEventListener('click', (e) => {
+    const reset = () => { state.chat = emptyChat(); saveChat(); clearTaskState('draft'); render(); };
+    if (state.chat.dirty) confirmTap(e.currentTarget, reset); else reset();
+  });
+
+  function render() {
+    const v = state.view;
+    const onChat = v === 'chat' || (v === 'recipe' && state.current && state.current.draft);
+    document.querySelectorAll('.tab').forEach((t) => {
+      t.classList.toggle('active', t.dataset.view === (onChat ? 'chat' : 'list'));
+    });
+    $('backBtn').hidden = !(v === 'recipe' || v === 'edit');
+    $('newChatBtn').hidden = !(v === 'chat' && state.chat.display.length);
+    $('composer').hidden = v !== 'chat';
+
+    if (v === 'chat') renderChat();
+    else if (v === 'list') renderList();
+    else if (v === 'recipe') renderRecipe();
+    else if (v === 'edit') renderEdit();
+  }
+
+  // ===== צ'אט =====
+  const SUGGESTIONS = ['פסטה ברוטב עגבניות ל-4', 'עוגת שוקולד בלי קמח', 'ארוחת ערב צמחונית מהירה', 'שקשוקה'];
+
+  function renderChat() {
+    $('title').textContent = "צ'אט";
+    const c = state.chat;
+    let html = '';
+    if (c.editingId) html += `<div class="banner">משפר את המתכון השמור: <b>${esc(c.editingName)}</b></div>`;
+
+    if (!c.display.length) {
+      html += `<div class="empty"><h2>מה מבשלים?</h2>
+        <div>תאר מה בא לך, ואפשר להמשיך לדייק עד שהמתכון מושלם.</div>
+        ${c.editingId ? '' : `<div class="chips">${SUGGESTIONS.map((s) => `<button class="chip" data-suggest="${esc(s)}">${esc(s)}</button>`).join('')}</div>`}
+      </div>`;
+    }
+    c.display.forEach((m) => { html += `<div class="bubble ${m.role}">${esc(m.text)}</div>`; });
+    if (state.busy) html += `<div class="bubble assistant typing">חושב על זה…</div>`;
+
+    if (c.recipe && !state.busy) {
+      const r = c.recipe;
+      html += `<div class="card">
+        <h3>${esc(r.name)}</h3>
+        <div class="meta">${recipeMeta(r)}</div>
+        <div class="meta">${r.ingredients.length} מצרכים · ${r.steps.length} שלבים</div>
+        ${c.problems.length ? `<div class="warn">במבנה המתכון יש בעיה, ולכן תצוגת המטריצה לא תעבוד. אפשר לכתוב בצ'אט "תקן את מבנה המתכון".</div>` : ''}
+        <div class="actions">
+          <button class="btn primary" id="saveDraftBtn" ${c.dirty ? '' : 'disabled'}>${c.dirty ? (c.editingId ? 'עדכן מתכון' : 'שמור') : 'נשמר ✓'}</button>
+          <button class="btn" id="previewBtn">תצוגה מקדימה</button>
+        </div>
+      </div>`;
+    }
+    main.innerHTML = html;
+    main.scrollTop = main.scrollHeight;
+
+    main.querySelectorAll('[data-suggest]').forEach((b) => b.addEventListener('click', () => send(b.dataset.suggest)));
+    const saveBtn = $('saveDraftBtn');
+    if (saveBtn) saveBtn.addEventListener('click', saveDraft);
+    const previewBtn = $('previewBtn');
+    if (previewBtn) previewBtn.addEventListener('click', () => {
+      state.current = { id: null, recipe: c.recipe, draft: true, tab: 'ingredients' };
+      state.view = 'recipe';
+      render();
+    });
+    $('sendBtn').disabled = state.busy;
+  }
+
+  function send(text) {
+    text = (text || '').trim();
+    if (!text || state.busy) return;
+    const c = state.chat;
+    // בפתיחת שיחה על מתכון שמור, המתכון עצמו נשלח ל-Claude יחד עם ההודעה הראשונה
+    const content = c.history.length === 0 && c.context ? c.context + '\n\n' + text : text;
+    c.history.push({ role: 'user', content });
+    c.display.push({ role: 'user', text });
+    state.busy = true;
+    $('input').value = '';
+    autoGrow();
+    render();
+
+    server('chat', c.history).then((res) => {
+      c.history.push(...res.newMessages);
+      c.display.push({ role: 'assistant', text: res.message });
+      if (res.recipe) {
+        c.recipe = res.recipe;
+        c.problems = res.problems || [];
+        c.dirty = true;
+      }
+      saveChat();
+    }).catch((err) => {
+      // ההודעה לא נשלחה — מחזירים אותה לתיבת הטקסט
+      c.history.pop();
+      c.display.pop();
+      $('input').value = text;
+      autoGrow();
+      toast(err.message, true);
+    }).finally(() => {
+      state.busy = false;
+      if (state.view === 'chat') render();
+    });
+  }
+
+  function saveDraft() {
+    const c = state.chat;
+    const btn = $('saveDraftBtn');
+    if (btn) { btn.disabled = true; btn.textContent = 'שומר…'; }
+    server('saveRecipe', c.recipe, c.editingId).then((id) => {
+      c.editingId = id;
+      c.editingName = c.recipe.name;
+      c.dirty = false;
+      state.list = null;
+      saveChat();
+      toast('המתכון נשמר בגיליון ✓');
+    }).catch((err) => toast(err.message, true)).finally(render);
+  }
+
+  $('sendBtn').addEventListener('click', () => send($('input').value));
+  $('input').addEventListener('keydown', (e) => {
+    // במחשב: Enter שולח, Shift+Enter שורה חדשה
+    if (e.key === 'Enter' && !e.shiftKey && window.matchMedia('(pointer: fine)').matches) {
+      e.preventDefault();
+      send($('input').value);
+    }
+  });
+  function autoGrow() {
+    const el = $('input');
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 140) + 'px';
+  }
+  $('input').addEventListener('input', autoGrow);
+
+  // ===== רשימת מתכונים =====
+  function loadList() {
+    server('listRecipes').then((list) => {
+      state.list = list;
+      if (state.view === 'list') renderList();
+    }).catch((err) => toast(err.message, true));
+  }
+
+  function renderList() {
+    $('title').textContent = 'המתכונים שלי';
+    const focused = document.activeElement && document.activeElement.id === 'search';
+    let html = `<input id="search" class="search" type="search" placeholder="חיפוש לפי שם, קטגוריה או מצרך" value="${esc(state.query)}">`;
+    if (!state.list) {
+      html += `<div class="loading">טוען…</div>`;
+    } else {
+      const q = state.query.trim().toLowerCase();
+      const items = state.list.filter((r) => !q ||
+        [r.name, r.category, r.description, r.ingredients].join(' ').toLowerCase().includes(q));
+      if (!state.list.length) html += `<div class="empty"><h2>עדיין אין מתכונים</h2><div>בקש מתכון בצ'אט ולחץ "שמור".</div></div>`;
+      else if (!items.length) html += `<div class="empty">לא נמצאו מתכונים</div>`;
+      items.forEach((r) => {
+        html += `<div class="card recipe-item" role="button" tabindex="0" data-id="${esc(r.id)}">
+          <h3>${esc(r.name)}</h3>
+          <div class="meta">${r.category ? `<span class="tag">${esc(r.category)}</span>` : ''}${[r.servings ? r.servings + ' מנות' : '', r.totalTime].filter(Boolean).map(esc).join(' · ')}</div>
+          ${r.description ? `<div class="meta">${esc(r.description)}</div>` : ''}
+        </div>`;
+      });
+    }
+    main.innerHTML = html;
+    const search = $('search');
+    search.addEventListener('input', () => { state.query = search.value; renderList(); });
+    if (focused) { search.focus(); search.setSelectionRange(search.value.length, search.value.length); }
+    main.querySelectorAll('[data-id]').forEach((b) => b.addEventListener('click', () => openRecipe(b.dataset.id)));
+  }
+
+  function openRecipe(id) {
+    state.view = 'recipe';
+    state.current = null;
+    $('title').textContent = '';
+    main.innerHTML = `<div class="loading">טוען…</div>`;
+    $('backBtn').hidden = false;
+    server('getRecipe', id).then((res) => {
+      state.current = { id: res.id, recipe: res.recipe, draft: false, tab: 'ingredients' };
+      state.expandedStep = null;
+      if (state.view === 'recipe') render();
+    }).catch((err) => { toast(err.message, true); go('list'); });
+  }
+
+  // ===== מסך מתכון =====
+  function renderRecipe() {
+    const cur = state.current;
+    if (!cur) return;
+    const r = cur.recipe;
+    $('title').textContent = cur.draft ? 'תצוגה מקדימה' : r.name;
+
+    let html = `<h2 style="margin:0 0 4px">${esc(r.name)}</h2>
+      <div class="meta">${recipeMeta(r)}</div>
+      ${r.description ? `<p style="margin:8px 0 0">${esc(r.description)}</p>` : ''}
+      <div class="actions">`;
+    if (cur.draft) {
+      html += `<button class="btn" id="backToChatBtn">חזרה לצ'אט</button>`;
+    } else {
+      html += `<button class="btn primary" id="improveBtn">שפר בצ'אט</button>
+        <button class="btn" id="editBtn">ערוך פרטים</button>
+        <button class="btn danger" id="deleteBtn">מחק</button>`;
+    }
+    html += `</div>
+      <div class="segmented">
+        <button data-tab="ingredients" class="${cur.tab === 'ingredients' ? 'active' : ''}">מצרכים</button>
+        <button data-tab="tasks" class="${cur.tab === 'tasks' ? 'active' : ''}">משימות</button>
+        <button data-tab="matrix" class="${cur.tab === 'matrix' ? 'active' : ''}">מטריצה</button>
+      </div>
+      <div id="tabContent"></div>`;
+    main.innerHTML = html;
+
+    main.querySelectorAll('[data-tab]').forEach((b) => b.addEventListener('click', () => {
+      cur.tab = b.dataset.tab;
+      renderRecipe();
+    }));
+    if (cur.draft) {
+      $('backToChatBtn').addEventListener('click', () => go('chat'));
+    } else {
+      $('improveBtn').addEventListener('click', (e) => improveInChat(e.currentTarget));
+      $('editBtn').addEventListener('click', () => { state.view = 'edit'; render(); });
+      $('deleteBtn').addEventListener('click', (e) => confirmTap(e.currentTarget, deleteCurrent));
+    }
+
+    const box = $('tabContent');
+    if (cur.tab === 'ingredients') renderIngredients(box, r);
+    else if (cur.tab === 'tasks') renderTasks(box, r, cur.id || 'draft');
+    else renderMatrix(box, r);
+  }
+
+  function renderIngredients(box, r) {
+    box.innerHTML = `<div class="card"><ul class="ing-list">${r.ingredients.map((i) =>
+      `<li><span class="amount">${esc(i.amount)}</span> ${esc(i.name)}</li>`).join('')}</ul></div>`;
+  }
+
+  function improveInChat(button) {
+    const cur = state.current;
+    const start = () => {
+      state.chat = emptyChat();
+      state.chat.editingId = cur.id;
+      state.chat.editingName = cur.recipe.name;
+      state.chat.recipe = cur.recipe;
+      state.chat.context = 'זה מתכון ששמור אצלי. בכל שינוי שאבקש, החזר את המתכון המלא המעודכן.\n' + JSON.stringify(cur.recipe);
+      saveChat();
+      go('chat');
+      $('input').focus();
+    };
+    // אם בצ'אט יש מתכון שלא נשמר, מבקשים אישור לפני שמוחקים אותו
+    if (state.chat.dirty) confirmTap(button, start); else start();
+  }
+
+  function deleteCurrent() {
+    const id = state.current.id;
+    server('deleteRecipe', id).then(() => {
+      clearTaskState(id);
+      if (state.chat.editingId === id) { state.chat.editingId = null; state.chat.dirty = !!state.chat.recipe; saveChat(); }
+      toast('המתכון נמחק');
+      state.list = null;
+      go('list');
+    }).catch((err) => toast(err.message, true));
+  }
+
+  // ===== עריכת פרטים =====
+  function renderEdit() {
+    const r = state.current.recipe;
+    $('title').textContent = 'עריכת פרטים';
+    const categories = [...new Set((state.list || []).map((x) => x.category).filter(Boolean))];
+    main.innerHTML = `<div class="card form">
+      <label for="fName">שם</label>
+      <input id="fName" value="${esc(r.name)}">
+      <label for="fCategory">קטגוריה</label>
+      <input id="fCategory" list="categories" value="${esc(r.category)}">
+      <datalist id="categories">${categories.map((c) => `<option value="${esc(c)}">`).join('')}</datalist>
+      <label for="fServings">מנות</label>
+      <input id="fServings" type="number" inputmode="numeric" min="1" value="${esc(r.servings)}">
+      <div class="hint">שינוי מספר המנות כאן לא משנה את הכמויות. כדי להתאים כמויות, השתמש ב"שפר בצ'אט".</div>
+      <label for="fTime">זמן כולל (דקות)</label>
+      <input id="fTime" type="number" inputmode="numeric" min="0" value="${esc(r.totalMinutes)}">
+      <label for="fDesc">תיאור</label>
+      <textarea id="fDesc" rows="3">${esc(r.description)}</textarea>
+      <div class="hint">מצרכים ושלבים עורכים דרך "שפר בצ'אט", כדי שהקשרים בין השלבים יישארו תקינים.</div>
+      <div class="actions">
+        <button class="btn primary" id="saveEditBtn">שמור</button>
+        <button class="btn" id="cancelEditBtn">ביטול</button>
+      </div>
+    </div>`;
+    $('cancelEditBtn').addEventListener('click', () => { state.view = 'recipe'; render(); });
+    $('saveEditBtn').addEventListener('click', (e) => {
+      const name = $('fName').value.trim();
+      if (!name) { toast('צריך שם למתכון', true); return; }
+      const updated = Object.assign({}, r, {
+        name,
+        category: $('fCategory').value.trim(),
+        servings: parseInt($('fServings').value, 10) || r.servings,
+        totalMinutes: parseInt($('fTime').value, 10) || 0,
+        description: $('fDesc').value.trim(),
+      });
+      e.currentTarget.disabled = true;
+      server('saveRecipe', updated, state.current.id).then((id) => {
+        state.current.id = id;
+        state.current.recipe = updated;
+        state.list = null;
+        toast('נשמר ✓');
+        state.view = 'recipe';
+        render();
+      }).catch((err) => { toast(err.message, true); e.currentTarget.disabled = false; });
+    });
+  }
+
+  // ===== תצוגת משימות =====
+  // הסימונים והטיימרים נשמרים רק בטלפון הזה (localStorage), לא בגיליון
+  function loadTaskState(key) {
+    try { return JSON.parse(localStorage.getItem(TASKS_KEY + key)) || { done: {}, timers: {} }; }
+    catch (e) { return { done: {}, timers: {} }; }
+  }
+  function saveTaskState(key, ts) {
+    try { localStorage.setItem(TASKS_KEY + key, JSON.stringify(ts)); } catch (e) { }
+  }
+  function clearTaskState(key) {
+    try { localStorage.removeItem(TASKS_KEY + key); } catch (e) { }
+  }
+
+  function inputLabel(r, id) {
+    const ing = r.ingredients.find((i) => i.id === id);
+    if (ing) return ing.amount + ' ' + ing.name;
+    const idx = r.steps.findIndex((s) => s.id === id);
+    return idx >= 0 ? '← שלב ' + (idx + 1) + ': ' + r.steps[idx].title : id;
+  }
+
+  function renderTasks(box, r, key) {
+    const ts = loadTaskState(key);
+    const doneCount = r.steps.filter((s) => ts.done[s.id]).length;
+    let html = `<div class="meta">${doneCount} מתוך ${r.steps.length} שלבים</div>
+      <div class="progress"><div style="width:${r.steps.length ? (100 * doneCount / r.steps.length) : 0}%"></div></div>`;
+
+    r.steps.forEach((s, n) => {
+      const done = !!ts.done[s.id];
+      const times = [s.activeMinutes > 0 ? "עבודה " + formatMinutes(s.activeMinutes) : '',
+                     s.waitMinutes > 0 ? 'המתנה ' + formatMinutes(s.waitMinutes) : ''].filter(Boolean).join(' · ');
+      html += `<div class="card task ${done ? 'done' : ''}">
+        <input type="checkbox" data-step="${esc(s.id)}" ${done ? 'checked' : ''} aria-label="סיימתי את שלב ${n + 1}">
+        <div class="task-body">
+          <div class="task-title">${n + 1}. ${esc(s.title)}</div>
+          <div class="task-text">${esc(s.text)}</div>
+          ${s.inputs.length ? `<div class="inputs">${s.inputs.map((id) => `<span>${esc(inputLabel(r, id))}</span>`).join('')}</div>` : ''}
+          ${times ? `<div class="meta">${times}</div>` : ''}
+          ${s.waitMinutes > 0 ? `<div class="timer" data-timer="${esc(s.id)}">
+              <span class="time"></span>
+              <button class="btn" data-action="toggle">התחל</button>
+              <button class="btn" data-action="reset">איפוס</button>
+            </div>` : ''}
+        </div>
+      </div>`;
+    });
+    html += `<div class="actions"><button class="btn" id="resetTasksBtn">נקה את כל הסימונים</button></div>`;
+    box.innerHTML = html;
+
+    box.querySelectorAll('input[data-step]').forEach((cb) => cb.addEventListener('change', () => {
+      const t = loadTaskState(key);
+      if (cb.checked) t.done[cb.dataset.step] = true; else delete t.done[cb.dataset.step];
+      saveTaskState(key, t);
+      renderTasks(box, r, key);
+    }));
+    $('resetTasksBtn').addEventListener('click', (e) => confirmTap(e.currentTarget, () => {
+      clearTaskState(key);
+      renderTasks(box, r, key);
+    }));
+
+    box.querySelectorAll('[data-timer]').forEach((el) => {
+      const stepId = el.dataset.timer;
+      const step = r.steps.find((s) => s.id === stepId);
+      el.querySelector('[data-action=toggle]').addEventListener('click', () => {
+        unlockAudio();
+        const t = loadTaskState(key);
+        const timer = timerOf(t, step);
+        if (timer.endAt && timer.endAt <= Date.now()) {   // נגמר → עצירה ואיפוס
+          delete t.timers[stepId];
+          saveTaskState(key, t);
+          updateTimers();
+          return;
+        }
+        if (timer.endAt) {           // רץ → השהיה
+          timer.remainingMs = Math.max(0, timer.endAt - Date.now());
+          timer.endAt = null;
+        } else {                     // עצור → הפעלה
+          if (timer.remainingMs <= 0) timer.remainingMs = step.waitMinutes * 60000;
+          timer.endAt = Date.now() + timer.remainingMs;
+          timer.alerted = false;
+        }
+        t.timers[stepId] = timer;
+        saveTaskState(key, t);
+        updateTimers();
+      });
+      el.querySelector('[data-action=reset]').addEventListener('click', () => {
+        const t = loadTaskState(key);
+        delete t.timers[stepId];
+        saveTaskState(key, t);
+        updateTimers();
+      });
+    });
+    updateTimers();
+  }
+
+  function timerOf(ts, step) {
+    return ts.timers[step.id] || { endAt: null, remainingMs: step.waitMinutes * 60000, alerted: false };
+  }
+
+  function fmtClock(ms) {
+    const total = Math.ceil(ms / 1000);
+    const h = Math.floor(total / 3600), m = Math.floor((total % 3600) / 60), s = total % 60;
+    const pad = (x) => String(x).padStart(2, '0');
+    return (h ? h + ':' + pad(m) : m) + ':' + pad(s);
+  }
+
+  // רץ כל שנייה: מעדכן את הטיימרים שעל המסך ומשמיע התראה כשטיימר נגמר (גם אם עברת ללשונית אחרת)
+  function updateTimers() {
+    const cur = state.current;
+    if (!cur) return;
+    const key = cur.id || 'draft';
+    const ts = loadTaskState(key);
+    let changed = false;
+    cur.recipe.steps.filter((s) => s.waitMinutes > 0).forEach((step) => {
+      const timer = timerOf(ts, step);
+      const running = !!timer.endAt;
+      const left = running ? Math.max(0, timer.endAt - Date.now()) : timer.remainingMs;
+      const finished = running && left === 0;
+      const el = document.querySelector('[data-timer="' + CSS.escape(step.id) + '"]');
+      if (el) {
+        el.querySelector('.time').textContent = finished ? 'הזמן נגמר!' : fmtClock(left);
+        el.classList.toggle('finished', finished);
+        el.querySelector('[data-action=toggle]').textContent = finished ? 'עצור' : running ? 'השהה' : (left < step.waitMinutes * 60000 ? 'המשך' : 'התחל');
+      }
+      if (finished && !timer.alerted) {
+        timer.alerted = true;
+        ts.timers[step.id] = timer;
+        changed = true;
+        alarm();
+        toast('⏰ הזמן של "' + step.title + '" נגמר');
+      }
+    });
+    if (changed) saveTaskState(key, ts);
+  }
+  setInterval(updateTimers, 1000);
+
+  let audioCtx;
+  function unlockAudio() {
+    // דפדפנים מאפשרים צליל רק אחרי לחיצה של המשתמש, ולכן מכינים אותו בלחיצה על "התחל"
+    try {
+      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+    } catch (e) { }
+  }
+  function alarm() {
+    try { navigator.vibrate && navigator.vibrate([400, 200, 400, 200, 400]); } catch (e) { }
+    if (!audioCtx) return;
+    try {
+      [0, 0.5, 1].forEach((offset) => {
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.frequency.value = 880;
+        gain.gain.setValueAtTime(0.3, audioCtx.currentTime + offset);
+        gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + offset + 0.4);
+        osc.connect(gain).connect(audioCtx.destination);
+        osc.start(audioCtx.currentTime + offset);
+        osc.stop(audioCtx.currentTime + offset + 0.4);
+      });
+    } catch (e) { }
+  }
+
+  // ===== תצוגת מטריצה =====
+  /**
+   * בונה טבלה בסגנון Cooking for Engineers מתוך ה-inputs.
+   * המצרכים בעמודה הראשונה (בימין, כי הטבלה RTL). כל שלב יושב בעמודה אחת אחרי הקלט "העמוק" ביותר שלו,
+   * ומתפרש (rowspan) על כל השורות של המצרכים והשלבים שהוא משלב.
+   * מחזיר { notes, rows, cols } או { error }.
+   */
+  function buildMatrix(r) {
+    const ingById = new Map(r.ingredients.map((i) => [i.id, i]));
+    const stepIndex = new Map(r.steps.map((s, n) => [s.id, n]));
+    const prep = r.steps.filter((s) => !s.inputs.length);
+    const root = r.steps[r.steps.length - 1];
+    if (!root || !root.inputs.length) return { error: 'לשלב האחרון אין inputs.' };
+
+    const used = new Set();
+    const cells = [];   // { row, col, rowspan, colspan, kind, ... }
+    let rowCount = 0;
+
+    function visit(id) {
+      if (used.has(id)) throw new Error('"' + inputLabel(r, id) + '" משמש ביותר משלב אחד.');
+      used.add(id);
+      if (ingById.has(id)) {
+        const row = rowCount++;
+        cells.push({ row, col: 0, rowspan: 1, colspan: 1, kind: 'ing', item: ingById.get(id) });
+        return { row, span: 1, depth: 0 };
+      }
+      if (!stepIndex.has(id)) throw new Error('הפניה למזהה שלא קיים: ' + id);
+      const step = r.steps[stepIndex.get(id)];
+      if (!step.inputs.length) throw new Error('שלב ההכנה "' + step.title + '" משמש כקלט.');
+      const kids = step.inputs.map(visit);
+      const depth = 1 + Math.max(...kids.map((k) => k.depth));
+      // קלט "רדוד" ממשיך בתא ריק עד העמודה של השלב
+      kids.forEach((k) => {
+        if (k.depth < depth - 1) {
+          cells.push({ row: k.row, col: k.depth + 1, rowspan: k.span, colspan: depth - 1 - k.depth, kind: 'filler' });
+        }
+      });
+      const span = kids.reduce((sum, k) => sum + k.span, 0);
+      cells.push({ row: kids[0].row, col: depth, rowspan: span, colspan: 1, kind: 'step', item: step, number: stepIndex.get(id) + 1 });
+      return { row: kids[0].row, span, depth };
+    }
+
+    let top;
+    try { top = visit(root.id); } catch (e) { return { error: e.message }; }
+
+    const unused = r.ingredients.filter((i) => !used.has(i.id)).map((i) => i.name)
+      .concat(r.steps.filter((s) => s.inputs.length && !used.has(s.id)).map((s) => s.title));
+    if (unused.length) return { error: 'לא מחוברים לשלב ההגשה: ' + unused.join(', ') };
+
+    const rows = Array.from({ length: rowCount }, () => []);
+    cells.forEach((c) => rows[c.row].push(c));
+    rows.forEach((row) => row.sort((a, b) => a.col - b.col));
+    return { notes: prep, rows, cols: top.depth + 1 };
+  }
+
+  function renderMatrix(box, r) {
+    const m = buildMatrix(r);
+    if (m.error) {
+      box.innerHTML = `<div class="warn">אי אפשר לבנות מטריצה למתכון הזה: ${esc(m.error)}<br>
+        אפשר לפתוח אותו ב"שפר בצ'אט" ולכתוב "תקן את מבנה המתכון". תצוגת המשימות עובדת כרגיל.</div>`;
+      return;
+    }
+    let html = '';
+    if (m.notes.length) {
+      html += `<div class="notes">לפני שמתחילים: ${m.notes.map((s) => esc(s.title)).join(' · ')}</div>`;
+    }
+    html += `<div class="matrix-wrap"><table class="matrix"><tbody>`;
+    m.rows.forEach((row) => {
+      html += '<tr>';
+      row.forEach((c) => {
+        const span = `rowspan="${c.rowspan}" colspan="${c.colspan}"`;
+        if (c.kind === 'ing') {
+          html += `<td class="ing" ${span}><span class="amount">${esc(c.item.amount)}</span> ${esc(c.item.name)}</td>`;
+        } else if (c.kind === 'filler') {
+          html += `<td class="filler" ${span}></td>`;
+        } else {
+          const open = state.expandedStep === c.item.id;
+          html += `<td class="step" ${span} data-step="${esc(c.item.id)}">${esc(c.item.title)}${open ? `<small>${esc(c.item.text)}</small>` : ''}</td>`;
+        }
+      });
+      html += '</tr>';
+    });
+    const servings = r.servings ? ' · ' + esc(r.servings) + ' מנות' : '';
+    html += `<tr><td class="serve" colspan="${m.cols}">🍽️ מגישים${servings}</td></tr>`;
+    html += `</tbody></table></div>
+      <div class="meta" style="margin-top:8px">לחיצה על פעולה מציגה את ההוראה המלאה.<span id="scrollHint" hidden> הטבלה רחבה — גלול אותה הצידה.</span></div>`;
+    box.innerHTML = html;
+    const wrap = box.querySelector('.matrix-wrap');
+    $('scrollHint').hidden = wrap.scrollWidth <= wrap.clientWidth;
+
+    box.querySelectorAll('td.step').forEach((td) => td.addEventListener('click', () => {
+      state.expandedStep = state.expandedStep === td.dataset.step ? null : td.dataset.step;
+      renderMatrix(box, r);
+    }));
+  }
+
+  // ===== התחלה =====
+  render();
+</script>
